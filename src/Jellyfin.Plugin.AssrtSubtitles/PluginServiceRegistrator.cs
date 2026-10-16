@@ -1,3 +1,4 @@
+using System;
 using System.Net.Http.Headers;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
@@ -21,13 +22,13 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
     {
         serviceCollection.AddHttpClient(HttpClientName, client =>
         {
-            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue(
-                applicationHost.Name.Replace(' ', '_'),
-                applicationHost.ApplicationVersionString));
+            client.DefaultRequestHeaders.UserAgent.Clear();
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
             client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue(
                 "Jellyfin-Plugin-AssrtSubtitles",
-                typeof(PluginServiceRegistrator).Assembly.GetName().Version?.ToString() ?? "1.0.0"));
-            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                typeof(PluginServiceRegistrator).Assembly.GetName().Version?.ToString() ?? "0.2.0"));
+            client.Timeout = TimeSpan.FromSeconds(30);
         });
 
         serviceCollection.AddSingleton<AssrtApiClient>();

@@ -56,13 +56,25 @@ public class AssrtApiClient
     }
 
     /// <summary>
-    /// Downloads a file from assrt.net.
+    /// Downloads a file from assrt.net with appropriate headers and status checking.
     /// </summary>
     public async Task<byte[]> DownloadAsync(string url, CancellationToken cancellationToken)
     {
         var client = _httpClientFactory.CreateClient(PluginServiceRegistrator.HttpClientName);
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("*/*"));
+        request.Headers.Referrer = new Uri("https://assrt.net/");
+
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var statusCode = (int)response.StatusCode;
+            var reason = response.ReasonPhrase ?? string.Empty;
+            _logger.LogWarning("Download failed for {Url}: HTTP {StatusCode} {Reason}", url, statusCode, reason);
+            throw new HttpRequestException($"Download failed with status {statusCode} ({reason})", null, response.StatusCode);
+        }
+
         return await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -72,14 +84,18 @@ public class AssrtApiClient
 
         try
         {
-            using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Accept.Clear();
+            request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+
+            using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             return await JsonSerializer.DeserializeAsync<AssrtResponse>(stream, _serializerOptions, cancellationToken).ConfigureAwait(false);
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "Assrt API request to {Url} failed", url);
+            _logger.LogError(ex, "Assrt API request to {Url} failed: HTTP {StatusCode}", url, ex.StatusCode);
             return null;
         }
         catch (JsonException ex)
