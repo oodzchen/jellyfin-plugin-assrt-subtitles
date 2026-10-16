@@ -79,6 +79,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
     private readonly AssrtApiClient _apiClient;
     private readonly ILogger<AssrtSubtitleProvider> _logger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly PluginLocalizer _localizer;
     private readonly ConcurrentDictionary<string, SearchContext> _contextCache = new();
     private PluginConfiguration _configuration = new();
     private List<string> _preferredLanguages = new();
@@ -86,11 +87,16 @@ public class AssrtSubtitleProvider : ISubtitleProvider
     /// <summary>
     /// Initializes a new instance of the <see cref="AssrtSubtitleProvider"/> class.
     /// </summary>
-    public AssrtSubtitleProvider(AssrtApiClient apiClient, ILogger<AssrtSubtitleProvider> logger, IServiceProvider serviceProvider)
+    public AssrtSubtitleProvider(
+        AssrtApiClient apiClient,
+        ILogger<AssrtSubtitleProvider> logger,
+        IServiceProvider serviceProvider,
+        PluginLocalizer? localizer = null)
     {
         _apiClient = apiClient;
         _logger = logger;
         _serviceProvider = serviceProvider;
+        _localizer = localizer ?? serviceProvider.GetService<PluginLocalizer>() ?? new PluginLocalizer();
         Instance = this;
         if (Plugin.Instance?.Configuration is { } config)
         {
@@ -126,7 +132,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
                 .Where(s => !string.IsNullOrWhiteSpace(s.Id))
                 .ToList();
 
-            _logger.LogInformation("向客户端广播通知 [{Header}]: {Text} (目标会话数: {Count})", header, text, sessions.Count);
+            _logger.LogInformation("Broadcasting notification [{Header}]: {Text} (target sessions: {Count})", header, text, sessions.Count);
 
             var generalCmd = new GeneralCommand
             {
@@ -214,22 +220,23 @@ public class AssrtSubtitleProvider : ISubtitleProvider
     public async Task<SubtitleResponse> GetSubtitles(string id, CancellationToken cancellationToken)
     {
         var (subtitleId, context) = ParseSubtitleId(id);
+        var header = _localizer.NotificationHeader;
 
         var token = GetApiToken();
         if (string.IsNullOrWhiteSpace(token))
         {
-            const string tokenErr = "射手网 (Assrt) API Token 未配置，请前往控制台插件设置中配置！";
-            await SendNotificationAsync("射手网字幕", "❌ " + tokenErr, 6000).ConfigureAwait(false);
+            var tokenErr = _localizer.ErrTokenNotConfigured;
+            await SendNotificationAsync(header, "❌ " + tokenErr, 6000).ConfigureAwait(false);
             throw new InvalidOperationException(tokenErr);
         }
 
-        await SendNotificationAsync("射手网字幕", $"⏳ 正在解析字幕 #{subtitleId} 下载信息...", 2500).ConfigureAwait(false);
+        await SendNotificationAsync(header, _localizer.MsgFetchingSubtitleDetail(subtitleId), 2500).ConfigureAwait(false);
 
         var detail = await _apiClient.GetDetailAsync(token, subtitleId, cancellationToken).ConfigureAwait(false);
         if (detail is null)
         {
-            var notFoundErr = $"未在射手网找到字幕 #{subtitleId} 的详情。";
-            await SendNotificationAsync("射手网字幕", "❌ " + notFoundErr, 5000).ConfigureAwait(false);
+            var notFoundErr = _localizer.ErrSubtitleDetailNotFound(subtitleId);
+            await SendNotificationAsync(header, "❌ " + notFoundErr, 5000).ConfigureAwait(false);
             throw new FileNotFoundException(notFoundErr);
         }
 
@@ -240,12 +247,12 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         var candidates = GetDownloadCandidates(detail, preferredLanguages, context);
         if (candidates.Count == 0)
         {
-            var noFileErr = $"字幕“{title}”没有可供下载的文件地址。";
-            await SendNotificationAsync("射手网字幕", "❌ " + noFileErr, 5000).ConfigureAwait(false);
+            var noFileErr = _localizer.ErrNoDownloadableFiles(title);
+            await SendNotificationAsync(header, "❌ " + noFileErr, 5000).ConfigureAwait(false);
             throw new FileNotFoundException(noFileErr);
         }
 
-        await SendNotificationAsync("射手网字幕", $"⬇️ 开始下载: {title}", 3000).ConfigureAwait(false);
+        await SendNotificationAsync(header, _localizer.MsgDownloadingSubtitle(title), 3000).ConfigureAwait(false);
 
         byte[]? downloadedData = null;
         AssrtFileEntry? successfulFile = null;
@@ -258,10 +265,10 @@ public class AssrtSubtitleProvider : ISubtitleProvider
             {
                 if (i > 0)
                 {
-                    await SendNotificationAsync("射手网字幕", $"🔄 正在切换备用下载源 ({i + 1}/{candidates.Count})...", 2500).ConfigureAwait(false);
+                    await SendNotificationAsync(header, _localizer.MsgSwitchingFallbackCandidate(i + 1, candidates.Count), 2500).ConfigureAwait(false);
                 }
 
-                _logger.LogInformation("正在从射手网下载 [{Index}/{Total}]: {FileName} ({Url})", i + 1, candidates.Count, candidate.FileName, candidate.Url);
+                _logger.LogInformation("Downloading from Assrt [{Index}/{Total}]: {FileName} ({Url})", i + 1, candidates.Count, candidate.FileName, candidate.Url);
                 downloadedData = await _apiClient.DownloadAsync(candidate.Url!, cancellationToken).ConfigureAwait(false);
                 if (downloadedData != null && downloadedData.Length > 0)
                 {
@@ -272,35 +279,29 @@ public class AssrtSubtitleProvider : ISubtitleProvider
             catch (HttpRequestException ex) when ((int?)ex.StatusCode == 493)
             {
                 lastException = ex;
-                _logger.LogWarning("下载候选 {FileName} 触发 HTTP 493 (链接失效或受限)，正在尝试备用地址...", candidate.FileName);
+                _logger.LogWarning("Download candidate {FileName} returned HTTP 493, trying next candidate...", candidate.FileName);
             }
             catch (Exception ex)
             {
                 lastException = ex;
-                _logger.LogWarning(ex, "下载候选 {FileName} 失败: {Message}，正在尝试备用地址...", candidate.FileName, ex.Message);
+                _logger.LogWarning(ex, "Download candidate {FileName} failed: {Message}, trying next candidate...", candidate.FileName, ex.Message);
             }
         }
 
         if (downloadedData == null || successfulFile == null)
         {
-            string errMessage;
-            if (lastException is HttpRequestException { StatusCode: (System.Net.HttpStatusCode)493 })
-            {
-                errMessage = "下载失败：射手网接口返回 493（该字幕源直链已失效或受限），请在搜索结果中换选其他字幕条目。";
-            }
-            else
-            {
-                errMessage = $"下载失败：{lastException?.Message ?? "无法获取字幕文件"}，请尝试其他字幕条目。";
-            }
+            var errMessage = lastException is HttpRequestException { StatusCode: (System.Net.HttpStatusCode)493 }
+                ? _localizer.ErrDownloadHttp493
+                : _localizer.ErrDownloadGeneral(lastException?.Message);
 
-            await SendNotificationAsync("射手网字幕", "❌ " + errMessage, 7000).ConfigureAwait(false);
+            await SendNotificationAsync(header, "❌ " + errMessage, 7000).ConfigureAwait(false);
             throw new InvalidOperationException(errMessage, lastException);
         }
 
         var extension = GetExtension(successfulFile.FileName);
         if (ArchiveExtensions.Contains(extension) || IsArchiveData(downloadedData))
         {
-            await SendNotificationAsync("射手网字幕", "📦 正在解压并智能匹配剧集字幕文件...", 2500).ConfigureAwait(false);
+            await SendNotificationAsync(header, _localizer.MsgExtractingAndMatching, 2500).ConfigureAwait(false);
             var (stream, format, selectedName, batchSavedCount) = ExtractAndAutoDeployFromArchive(
                 downloadedData,
                 preferredLanguages,
@@ -309,28 +310,28 @@ public class AssrtSubtitleProvider : ISubtitleProvider
 
             if (stream is null)
             {
-                var extractErr = $"解压失败：无法从压缩包中提取有效的字幕文件 ({successfulFile.FileName})";
-                await SendNotificationAsync("射手网字幕", "❌ " + extractErr, 6000).ConfigureAwait(false);
+                var extractErr = _localizer.ErrExtractFailed(successfulFile.FileName ?? string.Empty);
+                await SendNotificationAsync(header, "❌ " + extractErr, 6000).ConfigureAwait(false);
                 throw new InvalidDataException(extractErr);
             }
 
             var fmt = format ?? "srt";
             var epInfo = context?.EpisodeNumber.HasValue == true
-                ? $" (匹配: {Path.GetFileName(selectedName)})"
+                ? _localizer.MsgMatchedFileSuffix(Path.GetFileName(selectedName))
                 : string.Empty;
 
             if (batchSavedCount > 0)
             {
                 await SendNotificationAsync(
-                    "射手网字幕",
-                    $"✅ 当前集字幕已就绪 ({fmt.ToUpperInvariant()}){epInfo}，并已自动为同季其余 {batchSavedCount} 集批量解压配好字幕！",
+                    header,
+                    _localizer.MsgSuccessWithBatchUnpack(fmt.ToUpperInvariant(), epInfo, batchSavedCount),
                     8000).ConfigureAwait(false);
             }
             else
             {
                 await SendNotificationAsync(
-                    "射手网字幕",
-                    $"✅ 字幕已成功下载并保存 ({fmt.ToUpperInvariant()}){epInfo}！请刷新页面或重新进入播放以选择新字幕。",
+                    header,
+                    _localizer.MsgSuccessSingle(fmt.ToUpperInvariant(), epInfo),
                     6000).ConfigureAwait(false);
             }
 
@@ -343,7 +344,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         }
 
         var directFormat = NormalizeFormatFromExtension(extension);
-        await SendNotificationAsync("射手网字幕", $"✅ 字幕已成功下载并保存 ({directFormat.ToUpperInvariant()})！请刷新页面或重新进入播放以选择新字幕。", 6000).ConfigureAwait(false);
+        await SendNotificationAsync(header, _localizer.MsgSuccessSingle(directFormat.ToUpperInvariant()), 6000).ConfigureAwait(false);
 
         return new SubtitleResponse
         {
@@ -415,13 +416,13 @@ public class AssrtSubtitleProvider : ISubtitleProvider
     {
         if (string.IsNullOrWhiteSpace(id))
         {
-            throw new ArgumentException("字幕 ID 不能为空", nameof(id));
+            throw new ArgumentException(_localizer.ErrSubtitleIdEmpty, nameof(id));
         }
 
         var parts = id.Split(':', 2);
         if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var subtitleId))
         {
-            throw new ArgumentException("字幕 ID 必须为数字", nameof(id));
+            throw new ArgumentException(_localizer.ErrSubtitleIdNotNumeric, nameof(id));
         }
 
         SearchContext? context = null;
@@ -503,7 +504,6 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         var baseName = entry.NativeName ?? entry.VideoName ?? entry.Title ?? $"Assrt #{entry.Id}";
         var format = NormalizeFormat(entry.SubType);
 
-        // 构造富有信息量的标题与描述标签，方便在搜索列表中甄别
         var tags = new List<string>();
         if (!string.IsNullOrWhiteSpace(format))
         {
@@ -525,7 +525,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
                 .Count();
             if (distinctEpisodes > 1)
             {
-                tags.Add($"全季包({distinctEpisodes}集)");
+                tags.Add(_localizer.TagSeasonPack(distinctEpisodes));
             }
         }
 
@@ -544,7 +544,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         var commentParts = new List<string>();
         if (!string.IsNullOrWhiteSpace(entry.ReleaseSite))
         {
-            commentParts.Add($"来源: {entry.ReleaseSite}");
+            commentParts.Add(_localizer.CommentSource(entry.ReleaseSite));
         }
 
         if (!string.IsNullOrWhiteSpace(entry.LanguageInfo?.Description))
@@ -554,7 +554,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
 
         if (!string.IsNullOrWhiteSpace(entry.FileName))
         {
-            commentParts.Add($"文件: {entry.FileName}");
+            commentParts.Add(_localizer.CommentFile(entry.FileName));
         }
 
         var comment = commentParts.Count > 0 ? string.Join(" | ", commentParts) : null;
@@ -579,7 +579,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         };
     }
 
-    private static string? GetLanguageTag(AssrtLanguageInfo? info)
+    private string? GetLanguageTag(AssrtLanguageInfo? info)
     {
         if (info == null)
         {
@@ -591,22 +591,22 @@ public class AssrtSubtitleProvider : ISubtitleProvider
             var d = info.Description;
             if (d.Contains("双语"))
             {
-                return "双语";
+                return _localizer.TagBilingual;
             }
 
             if (d.Contains("简体") || d.Contains("简中") || d.Contains("chs", StringComparison.OrdinalIgnoreCase))
             {
-                return "简中";
+                return _localizer.TagSimplifiedChinese;
             }
 
             if (d.Contains("繁体") || d.Contains("繁中") || d.Contains("cht", StringComparison.OrdinalIgnoreCase))
             {
-                return "繁中";
+                return _localizer.TagTraditionalChinese;
             }
 
             if (d.Contains("中英"))
             {
-                return "中英";
+                return _localizer.TagChsEng;
             }
         }
 

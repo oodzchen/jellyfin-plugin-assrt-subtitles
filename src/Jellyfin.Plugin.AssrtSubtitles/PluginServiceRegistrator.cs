@@ -31,6 +31,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             client.Timeout = TimeSpan.FromSeconds(30);
         });
 
+        serviceCollection.AddSingleton<PluginLocalizer>();
         serviceCollection.AddSingleton<AssrtApiClient>();
         serviceCollection.AddSingleton<ISubtitleProvider, AssrtSubtitleProvider>();
     }

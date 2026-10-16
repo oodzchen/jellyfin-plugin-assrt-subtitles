@@ -9,34 +9,34 @@
             <div class="content-primary">
                 <form id="assrtSubtitlesConfigForm">
                     <div class="inputContainer">
-                        <label for="assrtApiToken">API token</label>
+                        <label for="assrtApiToken" data-i18n="labelApiToken">API Token</label>
                         <input id="assrtApiToken" name="assrtApiToken" type="text" required />
-                        <div class="fieldDescription">
+                        <div class="fieldDescription" data-i18n="descApiToken">
                             Token from assrt.net. A development token is pre-filled for convenience.
                         </div>
                     </div>
 
                     <div class="inputContainer">
-                        <label for="assrtLanguages">Preferred languages</label>
+                        <label for="assrtLanguages" data-i18n="labelPreferredLanguages">Preferred Languages</label>
                         <input id="assrtLanguages" name="assrtLanguages" type="text" placeholder="zho, eng" />
-                        <div class="fieldDescription">
-                            Comma separated ISO 639-3 codes (for example: zho, eng). Leave empty to use server defaults.
+                        <div class="fieldDescription" data-i18n="descPreferredLanguages">
+                            Comma-separated ISO 639-3 codes (for example: zho, eng). Leave empty to use server defaults.
                         </div>
                     </div>
 
                     <div class="checkboxContainer checkboxContainer-withDescription">
                         <label class="emby-checkbox-label">
                             <input id="assrtAutoUnpackSeason" name="assrtAutoUnpackSeason" type="checkbox" is="emby-checkbox" />
-                            <span>整季字幕自动全量解压并匹配剧集 (Auto-unpack season pack to all episodes)</span>
+                            <span data-i18n="labelAutoUnpackSeason">Auto-unpack season pack to all episodes</span>
                         </label>
-                        <div class="fieldDescription checkboxFieldDescription">
-                            开启后，当下载剧集字幕遇到合集/全季压缩包时，除了提取当前集字幕外，还会自动将包内同季其他集的字幕一并解压、重命名并关联到对应剧集视频。
+                        <div class="fieldDescription checkboxFieldDescription" data-i18n="descAutoUnpackSeason">
+                            When downloading a full-season subtitle archive for an episode, automatically extract, rename, and match subtitles for all other episodes in the same season folder.
                         </div>
                     </div>
 
                     <div>
                         <button is="emby-button" type="submit" class="raised button-submit block emby-button">
-                            <span>保存 (Save)</span>
+                            <span data-i18n="buttonSave">Save</span>
                         </button>
                     </div>
                 </form>
@@ -52,7 +52,70 @@
                 const languagesInput = document.querySelector("#assrtLanguages");
                 const autoUnpackInput = document.querySelector("#assrtAutoUnpackSeason");
 
+                const i18nStrings = {
+                    "zh-hans": {
+                        labelApiToken: "Assrt API 密钥",
+                        descApiToken: "来自 assrt.net（射手网）的 API Token，已预填默认密钥以便开箱即用。",
+                        labelPreferredLanguages: "首选字幕语言",
+                        descPreferredLanguages: "以英文逗号分隔的 ISO 639-3 语言代码（例如：zho, eng）。留空则使用服务器默认设置。",
+                        labelAutoUnpackSeason: "整季字幕包自动全量解压并匹配剧集",
+                        descAutoUnpackSeason: "开启后，当下载剧集字幕遇到合集/全季压缩包时，除了提取当前集字幕外，还会自动将包内同季其他集的字幕一并解压、重命名并关联到对应剧集视频。",
+                        buttonSave: "保存"
+                    },
+                    "zh-hant": {
+                        labelApiToken: "Assrt API 金鑰",
+                        descApiToken: "來自 assrt.net（射手網）的 API Token，已預填預設金鑰以便開箱即用。",
+                        labelPreferredLanguages: "首選字幕語言",
+                        descPreferredLanguages: "以英文逗號分隔的 ISO 639-3 語言代碼（例如：zho, eng）。留空則使用伺服器預設值。",
+                        labelAutoUnpackSeason: "整季字幕包自動全量解壓縮並配對劇集",
+                        descAutoUnpackSeason: "開啟後，當下載劇集字幕遇到合集/全季壓縮檔時，除了擷取目前集數字幕外，還會自動將壓縮檔內同季其他集數的字幕一併解壓縮、重新命名並關聯到對應劇集影片。",
+                        buttonSave: "儲存"
+                    },
+                    "en": {
+                        labelApiToken: "Assrt API Token",
+                        descApiToken: "API token from assrt.net. A default token is pre-filled for convenience.",
+                        labelPreferredLanguages: "Preferred Subtitle Languages",
+                        descPreferredLanguages: "Comma-separated ISO 639-3 language codes (for example: zho, eng). Leave empty to use server defaults.",
+                        labelAutoUnpackSeason: "Auto-unpack season pack to all episodes",
+                        descAutoUnpackSeason: "When downloading a full-season subtitle archive for an episode, automatically extract, rename, and match subtitles for all other episodes in the same season folder.",
+                        buttonSave: "Save"
+                    }
+                };
+
+                function resolveLocaleKey() {
+                    const htmlEl = document.documentElement;
+                    const rawCulture = (
+                        htmlEl.getAttribute("data-culture") ||
+                        htmlEl.getAttribute("lang") ||
+                        navigator.language ||
+                        "en"
+                    ).toLowerCase();
+
+                    if (rawCulture.startsWith("zh")) {
+                        if (rawCulture.includes("tw") || rawCulture.includes("hk") || rawCulture.includes("mo") || rawCulture.includes("hant")) {
+                            return "zh-hant";
+                        }
+                        return "zh-hans";
+                    }
+                    return "en";
+                }
+
+                function applyLocalization() {
+                    if (!page) {
+                        return;
+                    }
+                    const locale = resolveLocaleKey();
+                    const dict = i18nStrings[locale] || i18nStrings.en;
+                    page.querySelectorAll("[data-i18n]").forEach(el => {
+                        const key = el.getAttribute("data-i18n");
+                        if (key && dict[key]) {
+                            el.textContent = dict[key];
+                        }
+                    });
+                }
+
                 function loadConfiguration() {
+                    applyLocalization();
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(pluginId).then(config => {
                         if (tokenInput) {
@@ -94,6 +157,7 @@
                     return false;
                 }
 
+                applyLocalization();
                 page?.addEventListener("pageshow", loadConfiguration);
                 page?.addEventListener("viewshow", loadConfiguration);
                 form?.addEventListener("submit", saveConfiguration);
