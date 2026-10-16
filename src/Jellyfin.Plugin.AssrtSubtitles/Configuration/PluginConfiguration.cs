@@ -17,4 +17,9 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets the preferred subtitle languages (ISO 639-3 codes).
     /// </summary>
     public List<string> PreferredLanguages { get; set; } = new() { "zho", "eng" };
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to automatically unpack and match full-season subtitle archives to all episodes in the same season folder.
+    /// </summary>
+    public bool AutoUnpackSeasonPack { get; set; } = true;
 }

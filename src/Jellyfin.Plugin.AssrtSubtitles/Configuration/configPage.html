@@ -24,51 +24,81 @@
                         </div>
                     </div>
 
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="assrtAutoUnpackSeason" name="assrtAutoUnpackSeason" type="checkbox" is="emby-checkbox" />
+                            <span>整季字幕自动全量解压并匹配剧集 (Auto-unpack season pack to all episodes)</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            开启后，当下载剧集字幕遇到合集/全季压缩包时，除了提取当前集字幕外，还会自动将包内同季其他集的字幕一并解压、重命名并关联到对应剧集视频。
+                        </div>
+                    </div>
+
                     <div>
                         <button is="emby-button" type="submit" class="raised button-submit block emby-button">
-                            <span>Save</span>
+                            <span>保存 (Save)</span>
                         </button>
                     </div>
                 </form>
             </div>
         </div>
+
+        <script type="text/javascript">
+            (function () {
+                const pluginId = "6c94cceb-4ebc-4d5c-bbb6-2d1c9d0c2e40";
+                const page = document.querySelector("#assrtSubtitlesConfigurationPage");
+                const form = document.querySelector("#assrtSubtitlesConfigForm");
+                const tokenInput = document.querySelector("#assrtApiToken");
+                const languagesInput = document.querySelector("#assrtLanguages");
+                const autoUnpackInput = document.querySelector("#assrtAutoUnpackSeason");
+
+                function loadConfiguration() {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(config => {
+                        if (tokenInput) {
+                            tokenInput.value = config.ApiToken || "";
+                        }
+                        if (languagesInput) {
+                            languagesInput.value = (config.PreferredLanguages || []).join(", ");
+                        }
+                        if (autoUnpackInput) {
+                            autoUnpackInput.checked = config.AutoUnpackSeasonPack !== false;
+                        }
+                        Dashboard.hideLoadingMsg();
+                    }).catch(err => {
+                        console.error("Failed to load Assrt configuration:", err);
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function saveConfiguration(event) {
+                    event.preventDefault();
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(config => {
+                        config.ApiToken = (tokenInput?.value || "").trim();
+                        config.PreferredLanguages = (languagesInput?.value || "")
+                            .split(",")
+                            .map(x => x.trim())
+                            .filter(Boolean);
+                        if (autoUnpackInput) {
+                            config.AutoUnpackSeasonPack = autoUnpackInput.checked;
+                        }
+
+                        return ApiClient.updatePluginConfiguration(pluginId, config);
+                    }).then(result => {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                    }).catch(err => {
+                        console.error("Failed to save Assrt configuration:", err);
+                        Dashboard.hideLoadingMsg();
+                    });
+                    return false;
+                }
+
+                page?.addEventListener("pageshow", loadConfiguration);
+                page?.addEventListener("viewshow", loadConfiguration);
+                form?.addEventListener("submit", saveConfiguration);
+            }());
+        </script>
     </div>
-
-    <script type="text/javascript">
-        (function () {
-            const pluginId = "6c94cceb-4ebc-4d5c-bbb6-2d1c9d0c2e40";
-            const form = document.querySelector("#assrtSubtitlesConfigForm");
-            const page = document.querySelector("#assrtSubtitlesConfigurationPage");
-            const tokenInput = document.querySelector("#assrtApiToken");
-            const languagesInput = document.querySelector("#assrtLanguages");
-
-            function loadConfiguration() {
-                Dashboard.showLoadingMsg();
-                ApiClient.getPluginConfiguration(pluginId).then(config => {
-                    tokenInput.value = config.ApiToken || "";
-                    languagesInput.value = (config.PreferredLanguages || []).join(", ");
-                    Dashboard.hideLoadingMsg();
-                });
-            }
-
-            function saveConfiguration(event) {
-                event.preventDefault();
-                Dashboard.showLoadingMsg();
-                ApiClient.getPluginConfiguration(pluginId).then(config => {
-                    config.ApiToken = tokenInput.value.trim();
-                    config.PreferredLanguages = languagesInput.value
-                        .split(",")
-                        .map(x => x.trim())
-                        .filter(Boolean);
-
-                    return ApiClient.updatePluginConfiguration(pluginId, config);
-                }).then(Dashboard.processPluginConfigurationUpdateResult);
-            }
-
-            document.addEventListener("DOMContentLoaded", loadConfiguration);
-            page?.addEventListener("pageshow", loadConfiguration);
-            form?.addEventListener("submit", saveConfiguration);
-        }());
-    </script>
 </body>
 </html>
