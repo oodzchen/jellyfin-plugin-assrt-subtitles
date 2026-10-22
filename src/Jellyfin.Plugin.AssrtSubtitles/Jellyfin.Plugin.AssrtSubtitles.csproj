@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Authors>jellyfin-plugin-assrt-subtitles</Authors>
     <Company>jellyfin-plugin-assrt-subtitles</Company>
   </PropertyGroup>
@@ -19,5 +19,6 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Web\AssrtSubtitleEditorScript.js" />
   </ItemGroup>
 </Project>

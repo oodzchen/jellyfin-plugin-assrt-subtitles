@@ -4,7 +4,10 @@ Fetch and download subtitles from [assrt.net](https://assrt.net/api/doc) directl
 
 ## Features
 - Searches assrt.net for matching subtitles for movies and TV episodes.
-- Downloads direct subtitle files or extracts archives on the fly.
+- **Custom Search Keywords in UI**: Injects a custom search keyword input box and clickable auto-query tags directly into Jellyfin Web's "Edit Subtitles" dialog.
+- **Metadata-Driven Search (`OriginalTitle` & Tags)**: Automatically reads the media item's `OriginalTitle` (e.g., English/Japanese original name) and supports per-item/per-series custom search keywords via Jellyfin metadata tags (`assrt:Keyword` or `字幕:关键字`).
+- **Global Keyword Alias Mappings**: Configure `OriginalName = SearchKeyword` rules in the plugin settings to work across all Jellyfin clients (Web, Desktop, Mobile, TV).
+- **Smart Season Pack Unpacking**: Downloads direct subtitle files or extracts nested archives (`.zip`, `.rar`, `.7z`) on the fly, and automatically unpacks & matches full-season subtitle packs to all episodes in the same season folder.
 - Configurable API token and preferred ISO 639-3 language codes.
 - Ships with a GitHub Actions workflow that builds and bundles the plugin artifact.
 

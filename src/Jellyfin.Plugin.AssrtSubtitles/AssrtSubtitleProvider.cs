@@ -10,6 +10,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.AssrtSubtitles.Configuration;
 using Jellyfin.Plugin.AssrtSubtitles.Models;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
@@ -76,11 +78,14 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         ['十'] = 10, ['拾'] = 10, ['Ⅹ'] = 10
     };
 
+    private static readonly AsyncLocal<CustomSearchContext?> CurrentRequestSearchContext = new();
+
     private readonly AssrtApiClient _apiClient;
     private readonly ILogger<AssrtSubtitleProvider> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly PluginLocalizer _localizer;
     private readonly ConcurrentDictionary<string, SearchContext> _contextCache = new();
+    private readonly ConcurrentDictionary<string, CustomSearchContext> _customSearchOverrides = new(StringComparer.OrdinalIgnoreCase);
     private PluginConfiguration _configuration = new();
     private List<string> _preferredLanguages = new();
 
@@ -183,7 +188,7 @@ public class AssrtSubtitleProvider : ISubtitleProvider
             return Enumerable.Empty<RemoteSubtitleInfo>();
         }
 
-        var queries = BuildQueries(request);
+        var queries = BuildQueries(request, out var isCustomQuery);
         if (queries.Count == 0)
         {
             _logger.LogDebug("Could not build a search query for the incoming request");
@@ -193,27 +198,30 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         var preferredLanguages = BuildPreferredLanguageList(request);
         var contextKey = StoreSearchContext(request, preferredLanguages);
 
-        var mergedEntries = new List<AssrtSubtitleEntry>();
+        var mergedEntries = new List<(AssrtSubtitleEntry Entry, string MatchedQuery)>();
         var seenIds = new HashSet<int>();
+        var maxQueriesToRun = isCustomQuery ? Math.Min(queries.Count, 4) : Math.Min(queries.Count, 5);
 
-        foreach (var query in queries)
+        for (var i = 0; i < maxQueriesToRun; i++)
         {
+            var query = queries[i];
+            _logger.LogInformation("Searching Assrt [{Index}/{Total}] (custom={IsCustom}): {Query}", i + 1, maxQueriesToRun, isCustomQuery, query);
             var results = await _apiClient.SearchAsync(token, query, cancellationToken).ConfigureAwait(false);
             foreach (var entry in results)
             {
                 if (seenIds.Add(entry.Id))
                 {
-                    mergedEntries.Add(entry);
+                    mergedEntries.Add((entry, query));
                 }
             }
 
-            if (mergedEntries.Count >= 15)
+            if (mergedEntries.Count >= 18)
             {
                 break;
             }
         }
 
-        return mergedEntries.Select(entry => MapToResult(entry, preferredLanguages, request.Language, contextKey));
+        return mergedEntries.Select(item => MapToResult(item.Entry, preferredLanguages, request.Language, contextKey, item.MatchedQuery));
     }
 
     /// <inheritdoc />
@@ -434,37 +442,227 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         return (subtitleId, context);
     }
 
-    private static List<string> BuildQueries(SubtitleSearchRequest request)
+    /// <summary>
+    /// Sets the custom search context for the current async HTTP request pipeline and short-lived fallback cache.
+    /// </summary>
+    public IDisposable BeginRequestSearchContext(Guid? itemId, string? customQuery, bool appendEpisode, bool hasQueryParam)
     {
-        var queries = new List<string>();
-
-        if (request.ContentType == VideoContentType.Episode
-            && !string.IsNullOrWhiteSpace(request.SeriesName)
-            && request.ParentIndexNumber.HasValue
-            && request.IndexNumber.HasValue)
+        var ctx = new CustomSearchContext
         {
-            var englishSeriesName = ExtractEnglishTitleFromPath(request.MediaPath);
+            ItemId = itemId,
+            CustomQuery = string.IsNullOrWhiteSpace(customQuery) ? null : customQuery.Trim(),
+            AppendEpisode = appendEpisode,
+            CreatedAt = DateTime.UtcNow
+        };
 
-            // 1. Primary query: SeriesName S01E01
-            queries.Add($"{request.SeriesName} S{request.ParentIndexNumber.Value:00}E{request.IndexNumber.Value:00}");
+        CurrentRequestSearchContext.Value = ctx;
 
-            // 2. If MediaPath has a distinct English series name (e.g., "Wolf Hall" when SeriesName is "狼厅"), search that too
-            if (!string.IsNullOrWhiteSpace(englishSeriesName)
-                && !request.SeriesName.Contains(englishSeriesName, StringComparison.OrdinalIgnoreCase))
+        if (hasQueryParam)
+        {
+            SetCustomSearchOverride(itemId?.ToString("N"), customQuery, appendEpisode);
+        }
+
+        return new ActionDisposable(() => CurrentRequestSearchContext.Value = null);
+    }
+
+    /// <summary>
+    /// Stores or clears a short-lived custom search query override.
+    /// </summary>
+    public void SetCustomSearchOverride(string? itemId, string? customQuery, bool appendEpisode)
+    {
+        PruneExpiredCustomSearchOverrides();
+
+        var normalizedKey = NormalizeItemIdKey(itemId);
+        if (string.IsNullOrWhiteSpace(customQuery))
+        {
+            if (!string.IsNullOrEmpty(normalizedKey))
             {
-                queries.Add($"{englishSeriesName} S{request.ParentIndexNumber.Value:00}E{request.IndexNumber.Value:00}");
+                _customSearchOverrides.TryRemove(normalizedKey, out _);
             }
 
-            // 3. Fallback season pack query: SeriesName S01
-            queries.Add($"{request.SeriesName} S{request.ParentIndexNumber.Value:00}");
+            _customSearchOverrides.TryRemove("__latest__", out _);
+            return;
         }
-        else if (!string.IsNullOrWhiteSpace(request.Name))
+
+        Guid? parsedGuid = Guid.TryParse(itemId, out var g) ? g : null;
+        var entry = new CustomSearchContext
         {
-            queries.Add(request.Name);
+            ItemId = parsedGuid,
+            CustomQuery = customQuery.Trim(),
+            AppendEpisode = appendEpisode,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        if (!string.IsNullOrEmpty(normalizedKey))
+        {
+            _customSearchOverrides[normalizedKey] = entry;
         }
-        else if (!string.IsNullOrWhiteSpace(request.MediaPath))
+
+        _customSearchOverrides["__latest__"] = entry;
+    }
+
+    /// <summary>
+    /// Returns preview information and auto-generated candidate queries for the specified media item ID.
+    /// </summary>
+    public PreviewQueriesResult GetPreviewQueries(string? itemIdString)
+    {
+        var result = new PreviewQueriesResult
         {
-            queries.Add(Path.GetFileNameWithoutExtension(request.MediaPath));
+            EnableCustomUi = _configuration.EnableCustomSearchUi,
+            ItemId = itemIdString ?? string.Empty
+        };
+
+        if (!Guid.TryParse(itemIdString, out var itemId))
+        {
+            return result;
+        }
+
+        var libraryManager = _serviceProvider.GetService<ILibraryManager>();
+        var item = libraryManager?.GetItemById(itemId);
+        if (item == null)
+        {
+            return result;
+        }
+
+        var request = new SubtitleSearchRequest
+        {
+            MediaPath = item.Path,
+            Name = item.Name,
+            ProductionYear = item.ProductionYear
+        };
+
+        if (item is Episode ep)
+        {
+            request.ContentType = VideoContentType.Episode;
+            request.SeriesName = ep.SeriesName ?? ep.Series?.Name;
+            request.ParentIndexNumber = ep.ParentIndexNumber;
+            request.IndexNumber = ep.IndexNumber;
+            result.IsEpisode = true;
+            result.SeriesName = request.SeriesName;
+            result.OriginalTitle = ep.Series?.OriginalTitle ?? ep.OriginalTitle;
+            result.SeasonNumber = ep.ParentIndexNumber;
+            result.EpisodeNumber = ep.IndexNumber;
+        }
+        else
+        {
+            request.ContentType = VideoContentType.Movie;
+            result.IsEpisode = false;
+            result.OriginalTitle = item.OriginalTitle;
+        }
+
+        result.Name = item.Name;
+        var meta = ResolveMediaMetadata(request, itemId);
+        result.SeasonNumber ??= meta.SeasonNumber;
+        result.EpisodeNumber ??= meta.EpisodeNumber;
+        result.TagKeywords = meta.TagKeywords;
+        result.Queries = BuildAutomaticQueries(request, meta);
+        return result;
+    }
+
+    private void PruneExpiredCustomSearchOverrides()
+    {
+        var cutoff = DateTime.UtcNow.AddMinutes(-5);
+        foreach (var kv in _customSearchOverrides)
+        {
+            if (kv.Value.CreatedAt < cutoff)
+            {
+                _customSearchOverrides.TryRemove(kv.Key, out _);
+            }
+        }
+    }
+
+    private static string NormalizeItemIdKey(string? itemId)
+    {
+        if (string.IsNullOrWhiteSpace(itemId))
+        {
+            return string.Empty;
+        }
+
+        return Guid.TryParse(itemId, out var g) ? g.ToString("N") : itemId.Trim();
+    }
+
+    private CustomSearchContext? ResolveActiveCustomSearch(Guid? resolvedItemId)
+    {
+        if (CurrentRequestSearchContext.Value is { } asyncCtx && !string.IsNullOrWhiteSpace(asyncCtx.CustomQuery))
+        {
+            return asyncCtx;
+        }
+
+        PruneExpiredCustomSearchOverrides();
+
+        if (resolvedItemId.HasValue && _customSearchOverrides.TryRemove(resolvedItemId.Value.ToString("N"), out var byItem))
+        {
+            _customSearchOverrides.TryRemove("__latest__", out _);
+            return byItem;
+        }
+
+        if (_customSearchOverrides.TryRemove("__latest__", out var latest))
+        {
+            return latest;
+        }
+
+        return null;
+    }
+
+    private List<string> BuildQueries(SubtitleSearchRequest request, out bool isCustomQuery)
+    {
+        var requestItemId = CurrentRequestSearchContext.Value?.ItemId;
+        var meta = ResolveMediaMetadata(request, requestItemId);
+        var activeCustom = ResolveActiveCustomSearch(meta.ItemId);
+
+        if (activeCustom != null && !string.IsNullOrWhiteSpace(activeCustom.CustomQuery))
+        {
+            isCustomQuery = true;
+            return BuildCustomOverrideQueries(request, meta, activeCustom.CustomQuery, activeCustom.AppendEpisode);
+        }
+
+        isCustomQuery = false;
+        return BuildAutomaticQueries(request, meta);
+    }
+
+    private static List<string> BuildCustomOverrideQueries(
+        SubtitleSearchRequest request,
+        MediaMetadataInfo meta,
+        string customQueryInput,
+        bool appendEpisode)
+    {
+        var queries = new List<string>();
+        var segments = customQueryInput
+            .Split(new[] { '|', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var isEpisode = request.ContentType == VideoContentType.Episode || meta.EpisodeNumber.HasValue;
+        var season = meta.SeasonNumber;
+        var episode = meta.EpisodeNumber;
+
+        foreach (var kw in segments)
+        {
+            if (string.IsNullOrWhiteSpace(kw))
+            {
+                continue;
+            }
+
+            if (isEpisode && appendEpisode && !HasExplicitSeasonOrEpisode(kw))
+            {
+                if (season.HasValue && episode.HasValue)
+                {
+                    queries.Add($"{kw} S{season.Value:00}E{episode.Value:00}");
+                    queries.Add($"{kw} S{season.Value:00}");
+                    queries.Add(kw);
+                }
+                else if (episode.HasValue)
+                {
+                    queries.Add($"{kw} E{episode.Value:00}");
+                    queries.Add(kw);
+                }
+                else
+                {
+                    queries.Add(kw);
+                }
+            }
+            else
+            {
+                queries.Add(kw);
+            }
         }
 
         return queries
@@ -473,32 +671,583 @@ public class AssrtSubtitleProvider : ISubtitleProvider
             .ToList();
     }
 
-    private static string? ExtractEnglishTitleFromPath(string? mediaPath)
+    private List<string> BuildAutomaticQueries(SubtitleSearchRequest request, MediaMetadataInfo meta)
     {
-        if (string.IsNullOrWhiteSpace(mediaPath))
+        var queries = new List<string>();
+        var season = meta.SeasonNumber;
+        var episode = meta.EpisodeNumber;
+
+        if (request.ContentType == VideoContentType.Episode)
+        {
+            var seriesCandidates = new List<string>();
+
+            // 1. Metadata tags (e.g. assrt:Stranger Things) & config alias mappings
+            seriesCandidates.AddRange(meta.TagKeywords);
+            seriesCandidates.AddRange(meta.ConfiguredAliases);
+
+            // 2. Cleaned base SeriesName (strips trailing "Season 1", "第一季", "(2024)", etc.)
+            AddCandidateTitle(seriesCandidates, CleanSeriesTitle(request.SeriesName));
+
+            // 3. Series OriginalTitle from Jellyfin Library (e.g. English/Japanese original title)
+            AddCandidateTitle(seriesCandidates, CleanSeriesTitle(meta.SeriesOriginalTitle));
+
+            // 4. Titles extracted from video filename and parent series folder
+            foreach (var pathTitle in ExtractSeriesTitlesFromPath(request.MediaPath))
+            {
+                AddCandidateTitle(seriesCandidates, pathTitle);
+            }
+
+            // 5. Fallback to raw SeriesName if cleaning removed everything
+            if (seriesCandidates.Count == 0)
+            {
+                AddCandidateTitle(seriesCandidates, request.SeriesName);
+            }
+
+            seriesCandidates = seriesCandidates
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Tier 1: Exact Episode queries (e.g. "SeriesName S01E01", "OriginalTitle S01E01")
+            if (episode.HasValue)
+            {
+                foreach (var title in seriesCandidates)
+                {
+                    if (HasExplicitSeasonOrEpisode(title))
+                    {
+                        queries.Add(title);
+                    }
+                    else if (season.HasValue)
+                    {
+                        queries.Add($"{title} S{season.Value:00}E{episode.Value:00}");
+                    }
+                    else
+                    {
+                        queries.Add($"{title} E{episode.Value:00}");
+                    }
+                }
+            }
+
+            // Tier 2: Season pack queries (e.g. "SeriesName S01", "OriginalTitle S01", "SeriesName 第一季")
+            if (season.HasValue)
+            {
+                foreach (var title in seriesCandidates.Take(3))
+                {
+                    if (!HasExplicitSeasonOrEpisode(title))
+                    {
+                        queries.Add($"{title} S{season.Value:00}");
+                        if (ContainsCjk(title) && season.Value is >= 1 and <= 20)
+                        {
+                            queries.Add($"{title} 第{ToChineseNumber(season.Value)}季");
+                        }
+                    }
+                }
+            }
+
+            // Tier 3: Bare series title fallback (for full-series packs or miniseries)
+            foreach (var title in seriesCandidates.Take(2))
+            {
+                queries.Add(title);
+            }
+        }
+        else
+        {
+            // Movie / non-episode query generation
+            var year = meta.ProductionYear;
+
+            // 1. Metadata tags & configured aliases
+            foreach (var tagKw in meta.TagKeywords.Concat(meta.ConfiguredAliases))
+            {
+                queries.Add(tagKw);
+            }
+
+            // 2. Movie Name in Jellyfin
+            if (!string.IsNullOrWhiteSpace(request.Name))
+            {
+                queries.Add(request.Name.Trim());
+                var cleanedName = CleanMovieTitle(request.Name);
+                if (!string.IsNullOrWhiteSpace(cleanedName))
+                {
+                    queries.Add(cleanedName);
+                }
+            }
+
+            // 3. OriginalTitle from Jellyfin Library (e.g. "Dune: Part Two")
+            if (!string.IsNullOrWhiteSpace(meta.OriginalTitle))
+            {
+                var cleanOrig = CleanMovieTitle(meta.OriginalTitle) ?? meta.OriginalTitle.Trim();
+                if (year.HasValue && !cleanOrig.Contains(year.Value.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+                {
+                    queries.Add($"{cleanOrig} {year.Value.ToString(CultureInfo.InvariantCulture)}");
+                }
+
+                queries.Add(cleanOrig);
+            }
+
+            // 4. Cleaned titles extracted from filename / parent folder
+            foreach (var pathQuery in ExtractMovieTitlesFromPath(request.MediaPath, year))
+            {
+                queries.Add(pathQuery);
+            }
+
+            // 5. Movie Name + Year fallback
+            if (!string.IsNullOrWhiteSpace(request.Name) && year.HasValue &&
+                !request.Name.Contains(year.Value.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+            {
+                queries.Add($"{request.Name.Trim()} {year.Value.ToString(CultureInfo.InvariantCulture)}");
+            }
+        }
+
+        if (queries.Count == 0 && !string.IsNullOrWhiteSpace(request.MediaPath))
+        {
+            queries.Add(Path.GetFileNameWithoutExtension(request.MediaPath));
+        }
+
+        return queries
+            .Where(q => !string.IsNullOrWhiteSpace(q))
+            .Select(q => Regex.Replace(q.Trim(), @"\s{2,}", " "))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private MediaMetadataInfo ResolveMediaMetadata(SubtitleSearchRequest request, Guid? knownItemId)
+    {
+        var info = new MediaMetadataInfo
+        {
+            ItemId = knownItemId,
+            SeasonNumber = request.ParentIndexNumber,
+            EpisodeNumber = request.IndexNumber,
+            ProductionYear = request.ProductionYear
+        };
+
+        if ((!info.SeasonNumber.HasValue || !info.EpisodeNumber.HasValue) && !string.IsNullOrWhiteSpace(request.MediaPath))
+        {
+            var (parsedSeason, parsedEpisode) = TryParseSeasonEpisode(request.MediaPath);
+            info.SeasonNumber ??= parsedSeason;
+            info.EpisodeNumber ??= parsedEpisode;
+        }
+
+        try
+        {
+            var libraryManager = _serviceProvider.GetService<ILibraryManager>();
+            if (libraryManager != null)
+            {
+                BaseItem? item = null;
+                if (knownItemId.HasValue && knownItemId.Value != Guid.Empty)
+                {
+                    item = libraryManager.GetItemById(knownItemId.Value);
+                }
+
+                if (item == null && !string.IsNullOrWhiteSpace(request.MediaPath))
+                {
+                    item = libraryManager.FindByPath(request.MediaPath, isFolder: false);
+                }
+
+                if (item != null)
+                {
+                    info.ItemId = item.Id;
+                    info.ProductionYear ??= item.ProductionYear;
+                    ExtractCustomTags(item.Tags, info.TagKeywords);
+
+                    if (item is Episode ep)
+                    {
+                        info.SeasonNumber ??= ep.ParentIndexNumber;
+                        info.EpisodeNumber ??= ep.IndexNumber;
+
+                        var series = ep.Series;
+                        var season = ep.Season;
+                        if (season != null)
+                        {
+                            ExtractCustomTags(season.Tags, info.TagKeywords);
+                        }
+
+                        if (series != null)
+                        {
+                            info.SeriesOriginalTitle = series.OriginalTitle;
+                            info.ProductionYear ??= series.ProductionYear;
+                            ExtractCustomTags(series.Tags, info.TagKeywords);
+                        }
+
+                        info.OriginalTitle = ep.OriginalTitle;
+                    }
+                    else
+                    {
+                        info.OriginalTitle = item.OriginalTitle;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to resolve extra library metadata for subtitle search");
+        }
+
+        // Resolve configured keyword alias mappings
+        ResolveConfiguredAliases(request, info);
+
+        return info;
+    }
+
+    private static void ExtractCustomTags(string[]? tags, List<string> target)
+    {
+        if (tags == null || tags.Length == 0)
+        {
+            return;
+        }
+
+        foreach (var tag in tags)
+        {
+            if (string.IsNullOrWhiteSpace(tag))
+            {
+                continue;
+            }
+
+            var match = Regex.Match(tag.Trim(), @"^(?:assrt|sub|subtitle|字幕)\s*[:=：]\s*(?<kw>.+)$", RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                var parts = match.Groups["kw"].Value.Split(new[] { '|', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                foreach (var p in parts)
+                {
+                    if (!string.IsNullOrWhiteSpace(p) && !target.Contains(p, StringComparer.OrdinalIgnoreCase))
+                    {
+                        target.Add(p);
+                    }
+                }
+            }
+        }
+    }
+
+    private void ResolveConfiguredAliases(SubtitleSearchRequest request, MediaMetadataInfo info)
+    {
+        var rawMappings = _configuration.CustomKeywordMappings;
+        if (string.IsNullOrWhiteSpace(rawMappings))
+        {
+            return;
+        }
+
+        var candidateSources = new[]
+        {
+            request.SeriesName,
+            request.Name,
+            info.SeriesOriginalTitle,
+            info.OriginalTitle,
+            !string.IsNullOrWhiteSpace(request.MediaPath) ? Path.GetFileNameWithoutExtension(request.MediaPath) : null
+        }
+        .Where(s => !string.IsNullOrWhiteSpace(s))
+        .Select(s => s!.Trim())
+        .ToList();
+
+        if (candidateSources.Count == 0)
+        {
+            return;
+        }
+
+        var lines = rawMappings.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var line in lines)
+        {
+            if (line.StartsWith('#') || line.StartsWith("//", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var sepIndex = line.IndexOf('=');
+            if (sepIndex <= 0 || sepIndex >= line.Length - 1)
+            {
+                continue;
+            }
+
+            var sourcePattern = line[..sepIndex].Trim();
+            var targetKeywords = line[(sepIndex + 1)..].Trim();
+            if (string.IsNullOrWhiteSpace(sourcePattern) || string.IsNullOrWhiteSpace(targetKeywords))
+            {
+                continue;
+            }
+
+            var isMatch = candidateSources.Any(src =>
+                string.Equals(src, sourcePattern, StringComparison.OrdinalIgnoreCase) ||
+                src.Contains(sourcePattern, StringComparison.OrdinalIgnoreCase));
+
+            if (isMatch)
+            {
+                foreach (var kw in targetKeywords.Split(new[] { '|', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (!info.ConfiguredAliases.Contains(kw, StringComparer.OrdinalIgnoreCase))
+                    {
+                        info.ConfiguredAliases.Add(kw);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void AddCandidateTitle(List<string> list, string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return;
+        }
+
+        var trimmed = title.Trim();
+        if (trimmed.Length >= 1 && !list.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+        {
+            list.Add(trimmed);
+        }
+    }
+
+    private static string? CleanSeriesTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
         {
             return null;
         }
 
-        var fileName = Path.GetFileNameWithoutExtension(mediaPath);
-        var match = Regex.Match(fileName, @"^(?<title>[A-Za-z0-9\.\s'\-]+?)(?:[\.\s\-_]+\(\d{4}\))?[\.\s\-_]+S\d{1,2}[\.\s\-_]*E\d{1,3}", RegexOptions.IgnoreCase);
-        if (match.Success)
+        var cleaned = title.Trim();
+        // Strip trailing (2024) or （2024）
+        cleaned = Regex.Replace(cleaned, @"\s*[\(\[（【]\d{4}[\)\]）】]\s*$", string.Empty);
+        // Strip trailing "Season 1" / "S01" / "第一季"
+        cleaned = Regex.Replace(cleaned, @"\s+(?:Season\s*\d{1,2}|S\d{1,2}|第[0-9零〇一二两三四五六七八九十百]+季)\s*$", string.Empty, RegexOptions.IgnoreCase);
+        // Normalize colons/punctuation
+        var noPunct = cleaned.Replace('：', ' ').Replace(':', ' ').Replace('-', ' ');
+        noPunct = Regex.Replace(noPunct, @"\s{2,}", " ").Trim();
+        return string.IsNullOrWhiteSpace(noPunct) ? null : noPunct;
+    }
+
+    private static string? CleanMovieTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
         {
-            var title = match.Groups["title"].Value.Replace('.', ' ').Replace('_', ' ').Trim(' ', '-');
-            if (title.Length >= 2)
+            return null;
+        }
+
+        var cleaned = Regex.Replace(title.Trim(), @"\s*[\(\[（【]\d{4}[\)\]）】]\s*$", string.Empty);
+        cleaned = cleaned.Replace('：', ' ').Replace(':', ' ').Replace('·', ' ');
+        cleaned = Regex.Replace(cleaned, @"\s{2,}", " ").Trim();
+        return string.IsNullOrWhiteSpace(cleaned) ? null : cleaned;
+    }
+
+    private static List<string> ExtractSeriesTitlesFromPath(string? mediaPath)
+    {
+        var results = new List<string>();
+        if (string.IsNullOrWhiteSpace(mediaPath))
+        {
+            return results;
+        }
+
+        var fileName = Path.GetFileNameWithoutExtension(mediaPath);
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            // Match title before S01E01 / S01 / EP01 / 1x01
+            var match = Regex.Match(
+                fileName,
+                @"^(?:\[[^\]]+\]\s*)*(?<title>.+?)(?:[\.\s\-_]+[\(\[]?\d{4}[\)\]]?)?[\.\s\-_]+(?:S\d{1,2}[\.\s\-_]*E\d{1,3}|S\d{1,2}(?![0-9a-zA-Z])|(?:EP|Episode)[\.\s\-_]*\d{1,3}|\d{1,2}x\d{2,3}|第\s*[0-9零〇一二两三四五六七八九十]+\s*[集话話季])",
+                RegexOptions.IgnoreCase);
+            if (match.Success)
             {
-                return title;
+                AddExtractedPathTitles(results, match.Groups["title"].Value);
             }
         }
 
-        return null;
+        // Also check parent directories (e.g. /TV/Stranger.Things.S01/S01E01.mkv or /TV/狼厅.Wolf.Hall/Season 1/S01E01.mkv)
+        var dir = Path.GetDirectoryName(mediaPath);
+        for (var depth = 0; depth < 2 && !string.IsNullOrWhiteSpace(dir); depth++)
+        {
+            var folderName = Path.GetFileName(dir);
+            dir = Path.GetDirectoryName(dir);
+            if (string.IsNullOrWhiteSpace(folderName))
+            {
+                continue;
+            }
+
+            // Skip pure season folders like "Season 1", "Season 01", "S01", "Specials", "第1季"
+            if (Regex.IsMatch(folderName.Trim(), @"^(?:Season\s*\d{1,2}|S\d{1,2}|Specials|SPs?|第[0-9零〇一二两三四五六七八九十]+季|BD|DVD|1080[pP]|2160[pP]|4[kK])$", RegexOptions.IgnoreCase))
+            {
+                continue;
+            }
+
+            // Skip top-level library root folder names
+            if (Regex.IsMatch(folderName.Trim(), @"^(?:TV|TV\s*Shows?|Series|Anime|Movies?|Media|Video|剧集|电视剧|动漫|电影|影视)$", RegexOptions.IgnoreCase))
+            {
+                break;
+            }
+
+            AddExtractedPathTitles(results, folderName);
+            break;
+        }
+
+        return results;
+    }
+
+    private static List<string> ExtractMovieTitlesFromPath(string? mediaPath, int? knownYear)
+    {
+        var results = new List<string>();
+        if (string.IsNullOrWhiteSpace(mediaPath))
+        {
+            return results;
+        }
+
+        var fileName = Path.GetFileNameWithoutExtension(mediaPath);
+        ExtractCleanedMovieCandidates(fileName, knownYear, results);
+
+        var parentDir = Path.GetDirectoryName(mediaPath);
+        var folderName = !string.IsNullOrWhiteSpace(parentDir) ? Path.GetFileName(parentDir) : null;
+        if (!string.IsNullOrWhiteSpace(folderName) &&
+            !Regex.IsMatch(folderName.Trim(), @"^(?:Movies?|Media|Video|Film|电影|影视|BD|UHD|Remux)$", RegexOptions.IgnoreCase))
+        {
+            ExtractCleanedMovieCandidates(folderName, knownYear, results);
+        }
+
+        return results;
+    }
+
+    private static void ExtractCleanedMovieCandidates(string? rawName, int? knownYear, List<string> results)
+    {
+        if (string.IsNullOrWhiteSpace(rawName))
+        {
+            return;
+        }
+
+        // Remove leading release group tags like [阳光电影] or 【xx】
+        var cleaned = Regex.Replace(rawName, @"^(?:\[[^\]]+\]|【[^】]+】|\([^\)]+\))[\.\s\-_]*", string.Empty);
+
+        // Cut off at year (19xx or 20xx) or resolution/source token
+        var yearMatch = Regex.Match(cleaned, @"^(?<title>.+?)[\.\s\-_\(\[]+(?<year>(?:19|20)\d{2})(?![0-9pP])");
+        if (yearMatch.Success)
+        {
+            var titlePart = yearMatch.Groups["title"].Value;
+            var yearStr = yearMatch.Groups["year"].Value;
+            var extracted = SplitBilingualAndCleanTitle(titlePart);
+            foreach (var t in extracted)
+            {
+                if (!ContainsCjk(t))
+                {
+                    AddCandidateTitle(results, $"{t} {yearStr}");
+                }
+
+                AddCandidateTitle(results, t);
+            }
+
+            return;
+        }
+
+        // Otherwise strip common scene/release tags (1080p, 2160p, BluRay, WEB-DL, x264, etc.)
+        var tokenMatch = Regex.Match(
+            cleaned,
+            @"^(?<title>.+?)[\.\s\-_]+(?:2160p|1080p|720p|480p|4k|uhd|bluray|bdrip|brrip|web-dl|webrip|web|hdtv|remux|dvdrip|x264|x265|h264|h265|hevc|avc|aac|ddp|dts|truehd|atmos|hdr|dv|10bit|chs|cht|中英|双语|国粤|中字)",
+            RegexOptions.IgnoreCase);
+        var basePart = tokenMatch.Success ? tokenMatch.Groups["title"].Value : cleaned;
+
+        foreach (var t in SplitBilingualAndCleanTitle(basePart))
+        {
+            if (knownYear.HasValue && !ContainsCjk(t))
+            {
+                AddCandidateTitle(results, $"{t} {knownYear.Value.ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            AddCandidateTitle(results, t);
+        }
+    }
+
+    private static void AddExtractedPathTitles(List<string> results, string rawSegment)
+    {
+        foreach (var t in SplitBilingualAndCleanTitle(rawSegment))
+        {
+            AddCandidateTitle(results, t);
+        }
+    }
+
+    private static List<string> SplitBilingualAndCleanTitle(string raw)
+    {
+        var list = new List<string>();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return list;
+        }
+
+        // Remove bracketed tags and trailing year/season/scene markers
+        var s = Regex.Replace(raw, @"^(?:\[[^\]]*\]|【[^】]*】)\s*", string.Empty);
+        s = Regex.Replace(
+            s,
+            @"[\.\s\-_]+(?:S\d{1,2}(?:E\d{1,3})?|Season[\.\s\-_]*\d{1,2}|第[0-9零〇一二两三四五六七八九十]+季|2160p|1080p|720p|480p|4k|uhd|bluray|bdrip|brrip|web-dl|webrip|hdtv|remux|dvdrip|x264|x265|h264|h265|hevc).*$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"\[[^\]]*\]|【[^】]*】|\((?:19|20)\d{2}\)|（(?:19|20)\d{2}）", " ");
+        s = s.Replace('.', ' ').Replace('_', ' ').Trim(' ', '-', '·');
+        s = Regex.Replace(s, @"\s{2,}", " ").Trim();
+        if (string.IsNullOrWhiteSpace(s))
+        {
+            return list;
+        }
+
+        // Check if string starts with CJK title followed by English title (e.g., "狼厅 Wolf Hall" or "沙丘2 Dune Part Two")
+        var bilingualMatch = Regex.Match(s, @"^(?<cjk>[\u4e00-\u9fff][\u4e00-\u9fff0-9\s：:·]{0,25}?)\s+(?<eng>[A-Za-z][A-Za-z0-9\s'\-:]{2,})$");
+        if (bilingualMatch.Success)
+        {
+            var cjk = bilingualMatch.Groups["cjk"].Value.Trim();
+            var eng = bilingualMatch.Groups["eng"].Value.Trim();
+            if (cjk.Length >= 1)
+            {
+                list.Add(cjk);
+            }
+
+            if (eng.Length >= 2)
+            {
+                list.Add(eng);
+            }
+
+            return list;
+        }
+
+        if (s.Length >= 2 || ContainsCjk(s))
+        {
+            list.Add(s);
+        }
+
+        return list;
+    }
+
+    private static bool ContainsCjk(string text)
+    {
+        return Regex.IsMatch(text, @"[\u4e00-\u9fff]");
+    }
+
+    private static bool HasExplicitSeasonOrEpisode(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var (season, episode) = TryParseSeasonEpisode(text);
+        return season.HasValue || episode.HasValue;
+    }
+
+    private static string ToChineseNumber(int number)
+    {
+        string[] digits = { "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十" };
+        if (number is >= 1 and <= 10)
+        {
+            return digits[number];
+        }
+
+        if (number is > 10 and < 20)
+        {
+            return "十" + digits[number - 10];
+        }
+
+        if (number == 20)
+        {
+            return "二十";
+        }
+
+        return number.ToString(CultureInfo.InvariantCulture);
     }
 
     private RemoteSubtitleInfo MapToResult(
         AssrtSubtitleEntry entry,
         IReadOnlyList<string> preferredLanguages,
         string? requestLanguage,
-        string contextKey)
+        string contextKey,
+        string? matchedQuery = null)
     {
         var language = ResolveLanguage(entry.LanguageInfo, preferredLanguages, requestLanguage);
         var baseName = entry.NativeName ?? entry.VideoName ?? entry.Title ?? $"Assrt #{entry.Id}";
@@ -555,6 +1304,11 @@ public class AssrtSubtitleProvider : ISubtitleProvider
         if (!string.IsNullOrWhiteSpace(entry.FileName))
         {
             commentParts.Add(_localizer.CommentFile(entry.FileName));
+        }
+
+        if (!string.IsNullOrWhiteSpace(matchedQuery))
+        {
+            commentParts.Add(_localizer.CommentMatchedQuery(matchedQuery));
         }
 
         var comment = commentParts.Count > 0 ? string.Join(" | ", commentParts) : null;
@@ -1477,6 +2231,81 @@ public class AssrtSubtitleProvider : ISubtitleProvider
     private static string GetExtension(string? path)
     {
         return string.IsNullOrWhiteSpace(path) ? string.Empty : Path.GetExtension(path);
+    }
+
+    /// <summary>
+    /// Preview information and candidate search queries for a media item.
+    /// </summary>
+    public sealed class PreviewQueriesResult
+    {
+        public bool EnableCustomUi { get; set; } = true;
+
+        public string ItemId { get; set; } = string.Empty;
+
+        public string? Name { get; set; }
+
+        public string? SeriesName { get; set; }
+
+        public string? OriginalTitle { get; set; }
+
+        public int? SeasonNumber { get; set; }
+
+        public int? EpisodeNumber { get; set; }
+
+        public bool IsEpisode { get; set; }
+
+        public List<string> TagKeywords { get; set; } = new();
+
+        public List<string> Queries { get; set; } = new();
+    }
+
+    private sealed class CustomSearchContext
+    {
+        public Guid? ItemId { get; init; }
+
+        public string? CustomQuery { get; init; }
+
+        public bool AppendEpisode { get; init; } = true;
+
+        public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+    }
+
+    private sealed class MediaMetadataInfo
+    {
+        public Guid? ItemId { get; set; }
+
+        public string? SeriesOriginalTitle { get; set; }
+
+        public string? OriginalTitle { get; set; }
+
+        public int? SeasonNumber { get; set; }
+
+        public int? EpisodeNumber { get; set; }
+
+        public int? ProductionYear { get; set; }
+
+        public List<string> TagKeywords { get; } = new();
+
+        public List<string> ConfiguredAliases { get; } = new();
+    }
+
+    private sealed class ActionDisposable : IDisposable
+    {
+        private readonly Action _onDispose;
+        private int _disposed;
+
+        public ActionDisposable(Action onDispose)
+        {
+            _onDispose = onDispose;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _onDispose();
+            }
+        }
     }
 
     private sealed class SearchContext

@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Jellyfin.Plugin.AssrtSubtitles.Models;
@@ -24,6 +26,7 @@ public class AssrtResponse
 public class AssrtSubPayload
 {
     [JsonPropertyName("subs")]
+    [JsonConverter(typeof(LenientListJsonConverter<AssrtSubtitleEntry>))]
     public List<AssrtSubtitleEntry> Subs { get; set; } = new ();
 }
 
@@ -75,7 +78,48 @@ public class AssrtSubtitleEntry
     public AssrtLanguageInfo? LanguageInfo { get; set; }
 
     [JsonPropertyName("filelist")]
+    [JsonConverter(typeof(LenientListJsonConverter<AssrtFileEntry>))]
     public List<AssrtFileEntry>? FileList { get; set; }
+}
+
+/// <summary>
+/// Handles Assrt API returning an empty JSON object "{}" instead of an empty array "[]" when no items exist.
+/// </summary>
+/// <typeparam name="T">Element type.</typeparam>
+public sealed class LenientListJsonConverter<T> : JsonConverter<List<T>>
+{
+    /// <inheritdoc />
+    public override List<T> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.StartArray)
+        {
+            var list = new List<T>();
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            {
+                var item = JsonSerializer.Deserialize<T>(ref reader, options);
+                if (item != null)
+                {
+                    list.Add(item);
+                }
+            }
+
+            return list;
+        }
+
+        if (reader.TokenType == JsonTokenType.StartObject)
+        {
+            reader.Skip();
+            return new List<T>();
+        }
+
+        return new List<T>();
+    }
+
+    /// <inheritdoc />
+    public override void Write(Utf8JsonWriter writer, List<T> value, JsonSerializerOptions options)
+    {
+        JsonSerializer.Serialize(writer, value, options);
+    }
 }
 
 /// <summary>

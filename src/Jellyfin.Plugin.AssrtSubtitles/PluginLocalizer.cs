@@ -256,4 +256,11 @@ public class PluginLocalizer
         PluginLocale.ZhHant => $"檔案: {fileName}",
         _ => $"File: {fileName}"
     };
+
+    public string CommentMatchedQuery(string query) => GetCurrentLocale() switch
+    {
+        PluginLocale.ZhHans => $"搜索词: {query}",
+        PluginLocale.ZhHant => $"搜尋詞: {query}",
+        _ => $"Query: {query}"
+    };
 }

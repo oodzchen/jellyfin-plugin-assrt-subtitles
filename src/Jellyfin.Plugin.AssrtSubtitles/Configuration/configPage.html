@@ -34,6 +34,24 @@
                         </div>
                     </div>
 
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="assrtEnableCustomSearchUi" name="assrtEnableCustomSearchUi" type="checkbox" is="emby-checkbox" />
+                            <span data-i18n="labelEnableCustomSearchUi">Enable custom keyword input in subtitle search dialog</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription" data-i18n="descEnableCustomSearchUi">
+                            Inject a custom search keyword input box and clickable auto-query tags into Jellyfin Web's "Edit Subtitles" dialog. You can also specify per-item keywords via metadata tags (e.g., assrt:Keyword).
+                        </div>
+                    </div>
+
+                    <div class="inputContainer">
+                        <label for="assrtCustomKeywordMappings" data-i18n="labelCustomKeywordMappings">Custom Keyword Alias Mappings</label>
+                        <textarea is="emby-textarea" id="assrtCustomKeywordMappings" name="assrtCustomKeywordMappings" class="emby-textarea" rows="4" style="width:100%;" placeholder="怪奇物语 = Stranger Things"></textarea>
+                        <div class="fieldDescription" data-i18n="descCustomKeywordMappings">
+                            Optional keyword mapping rules (one per line, format: OriginalName = SearchKeyword). Works across all Jellyfin clients (Web, Mobile, TV).
+                        </div>
+                    </div>
+
                     <div>
                         <button is="emby-button" type="submit" class="raised button-submit block emby-button">
                             <span data-i18n="buttonSave">Save</span>
@@ -51,6 +69,8 @@
                 const tokenInput = document.querySelector("#assrtApiToken");
                 const languagesInput = document.querySelector("#assrtLanguages");
                 const autoUnpackInput = document.querySelector("#assrtAutoUnpackSeason");
+                const enableCustomUiInput = document.querySelector("#assrtEnableCustomSearchUi");
+                const keywordMappingsInput = document.querySelector("#assrtCustomKeywordMappings");
 
                 const i18nStrings = {
                     "zh-hans": {
@@ -60,6 +80,10 @@
                         descPreferredLanguages: "以英文逗号分隔的 ISO 639-3 语言代码（例如：zho, eng）。留空则使用服务器默认设置。",
                         labelAutoUnpackSeason: "整季字幕包自动全量解压并匹配剧集",
                         descAutoUnpackSeason: "开启后，当下载剧集字幕遇到合集/全季压缩包时，除了提取当前集字幕外，还会自动将包内同季其他集的字幕一并解压、重命名并关联到对应剧集视频。",
+                        labelEnableCustomSearchUi: "在「编辑字幕」弹窗中显示自定义搜索关键字输入框",
+                        descEnableCustomSearchUi: "开启后，在 Jellyfin Web 端的「修改字幕」弹窗中直接注入自定义关键字输入框与候选词标签。此外，您也可以在任意剧集/电影的「修改元数据 -> 标签」中添加 assrt:搜索词（或 字幕:搜索词）来指定专属关键字。",
+                        labelCustomKeywordMappings: "自定义搜索词映射规则（全局适用所有客户端）",
+                        descCustomKeywordMappings: "可选，每行一条，格式为「原片名/剧名 = Assrt搜索词」（多个搜索词可用 | 分隔，例如：怪奇物语 = Stranger Things）。配置后在 Web、手机 App、TV 端搜索字幕时均会自动生效。",
                         buttonSave: "保存"
                     },
                     "zh-hant": {
@@ -69,6 +93,10 @@
                         descPreferredLanguages: "以英文逗號分隔的 ISO 639-3 語言代碼（例如：zho, eng）。留空則使用伺服器預設值。",
                         labelAutoUnpackSeason: "整季字幕包自動全量解壓縮並配對劇集",
                         descAutoUnpackSeason: "開啟後，當下載劇集字幕遇到合集/全季壓縮檔時，除了擷取目前集數字幕外，還會自動將壓縮檔內同季其他集數的字幕一併解壓縮、重新命名並關聯到對應劇集影片。",
+                        labelEnableCustomSearchUi: "在「編輯字幕」彈窗中顯示自訂搜尋關鍵字輸入框",
+                        descEnableCustomSearchUi: "開啟後，在 Jellyfin Web 端的「修改字幕」彈窗中直接注入自訂關鍵字輸入框與候選詞標籤。此外，您也可以在任意劇集/電影的「修改中繼資料 -> 標籤」中新增 assrt:搜尋詞（或 字幕:搜尋詞）來指定專屬關鍵字。",
+                        labelCustomKeywordMappings: "自訂搜尋詞映射規則（全域適用所有用戶端）",
+                        descCustomKeywordMappings: "選填，每行一條，格式為「原片名/劇名 = Assrt搜尋詞」（多個搜尋詞可用 | 分隔，例如：怪奇物語 = Stranger Things）。設定後在 Web、手機 App、TV 端搜尋字幕時均會自動生效。",
                         buttonSave: "儲存"
                     },
                     "en": {
@@ -78,6 +106,10 @@
                         descPreferredLanguages: "Comma-separated ISO 639-3 language codes (for example: zho, eng). Leave empty to use server defaults.",
                         labelAutoUnpackSeason: "Auto-unpack season pack to all episodes",
                         descAutoUnpackSeason: "When downloading a full-season subtitle archive for an episode, automatically extract, rename, and match subtitles for all other episodes in the same season folder.",
+                        labelEnableCustomSearchUi: "Enable custom keyword input in subtitle search dialog",
+                        descEnableCustomSearchUi: "Inject a custom search keyword input box and clickable auto-query tags into Jellyfin Web's 'Edit Subtitles' dialog. You can also specify per-item keywords via metadata tags (e.g., assrt:Keyword).",
+                        labelCustomKeywordMappings: "Custom Keyword Alias Mappings",
+                        descCustomKeywordMappings: "Optional keyword mapping rules (one per line, format: OriginalName = SearchKeyword, separate multiple with |). Works across all Jellyfin clients (Web, Mobile, TV).",
                         buttonSave: "Save"
                     }
                 };
@@ -127,6 +159,12 @@
                         if (autoUnpackInput) {
                             autoUnpackInput.checked = config.AutoUnpackSeasonPack !== false;
                         }
+                        if (enableCustomUiInput) {
+                            enableCustomUiInput.checked = config.EnableCustomSearchUi !== false;
+                        }
+                        if (keywordMappingsInput) {
+                            keywordMappingsInput.value = config.CustomKeywordMappings || "";
+                        }
                         Dashboard.hideLoadingMsg();
                     }).catch(err => {
                         console.error("Failed to load Assrt configuration:", err);
@@ -146,6 +184,12 @@
                         if (autoUnpackInput) {
                             config.AutoUnpackSeasonPack = autoUnpackInput.checked;
                         }
+                        if (enableCustomUiInput) {
+                            config.EnableCustomSearchUi = enableCustomUiInput.checked;
+                        }
+                        if (keywordMappingsInput) {
+                            config.CustomKeywordMappings = (keywordMappingsInput.value || "").trim();
+                        }
 
                         return ApiClient.updatePluginConfiguration(pluginId, config);
                     }).then(result => {
@@ -157,7 +201,25 @@
                     return false;
                 }
 
+                function ensureClientScriptLoaded() {
+                    if (window.__assrtSubtitleEditorEnhanced) {
+                        return;
+                    }
+                    try {
+                        const scriptUrl = (window.ApiClient && typeof window.ApiClient.getUrl === "function")
+                            ? window.ApiClient.getUrl("AssrtSubtitles/ClientScript.js")
+                            : "AssrtSubtitles/ClientScript.js";
+                        const s = document.createElement("script");
+                        s.src = scriptUrl;
+                        s.defer = true;
+                        document.head.appendChild(s);
+                    } catch (e) {
+                        console.debug("Could not load Assrt ClientScript:", e);
+                    }
+                }
+
                 applyLocalization();
+                ensureClientScriptLoaded();
                 page?.addEventListener("pageshow", loadConfiguration);
                 page?.addEventListener("viewshow", loadConfiguration);
                 form?.addEventListener("submit", saveConfiguration);
